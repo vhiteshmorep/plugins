@@ -439,6 +439,8 @@ class Camera
         onSuccessCallback.run();
       }
 
+    } catch (IllegalStateException e) {
+      onErrorCallback.onError("cameraAccess", "Camera is closed: " + e.getMessage());
     } catch (CameraAccessException e) {
       onErrorCallback.onError("cameraAccess", e.getMessage());
     }
