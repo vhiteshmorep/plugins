@@ -8,8 +8,14 @@ import android.app.Activity;
 import android.hardware.camera2.CameraAccessException;
 import android.os.Handler;
 import android.os.Looper;
+
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
 import io.flutter.embedding.engine.systemchannels.PlatformChannel;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.EventChannel;
@@ -24,8 +30,7 @@ import io.flutter.plugins.camera.features.exposurelock.ExposureMode;
 import io.flutter.plugins.camera.features.flash.FlashMode;
 import io.flutter.plugins.camera.features.resolution.ResolutionPreset;
 import io.flutter.view.TextureRegistry;
-import java.util.HashMap;
-import java.util.Map;
+import timber.log.Timber;
 
 final class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
   private final Activity activity;
@@ -258,6 +263,19 @@ final class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
           }
           break;
         }
+      case "startBarcodeDetection":
+      {
+        try {
+          Timber.d("startBarcodeDetection Called from Dart");
+          List<Integer> formatList = call.argument("formats");
+          int imageRotation = (Integer) call.argument("imageRotation");
+          camera.startBarcodeDetection(imageStreamChannel,formatList,imageRotation);
+          result.success(null);
+        } catch (Exception e) {
+          handleException(e, result);
+        }
+        break;
+      }
       case "stopImageStream":
         {
           try {
@@ -268,6 +286,16 @@ final class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
           }
           break;
         }
+      case "stopBarcodeDetection": {
+        try {
+          camera.startPreview();
+          camera.closeDetector();
+          result.success(null);
+        } catch (Exception e) {
+          handleException(e, result);
+        }
+        break;
+      }
       case "getMaxZoomLevel":
         {
           assert camera != null;

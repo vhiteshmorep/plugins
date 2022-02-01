@@ -15,6 +15,23 @@ static FlutterError *getFlutterError(NSError *error) {
                              details:error.domain];
 }
 
+
+
+@implementation PlaneData
+
+- (instancetype)initWithData:(NSNumber *)width height:(NSNumber *)height bytesPerRow:(NSNumber *)bytesPerRow {
+    self = [super init];
+    if (self) {
+      _width = width;
+      _height = height;
+      _bytesPerRow = bytesPerRow;
+    }
+
+    return self;
+}
+
+@end
+
 @interface FLTSavePhotoDelegate : NSObject <AVCapturePhotoCaptureDelegate>
 @property(readonly, nonatomic) NSString *path;
 @property(readonly, nonatomic) FlutterResult result;
@@ -330,6 +347,8 @@ static ResolutionPreset getResolutionPresetForString(NSString *preset) {
 @property(assign, nonatomic) BOOL audioIsDisconnected;
 @property(assign, nonatomic) BOOL isAudioSetup;
 @property(assign, nonatomic) BOOL isStreamingImages;
+@property(assign, nonatomic) BOOL isScanningBarcode;
+@property(assign, nonatomic) BOOL isDetectingBarcodeFromImage;
 @property(assign, nonatomic) BOOL isPreviewPaused;
 @property(assign, nonatomic) ResolutionPreset resolutionPreset;
 @property(assign, nonatomic) ExposureMode exposureMode;
@@ -347,6 +366,7 @@ static ResolutionPreset getResolutionPresetForString(NSString *preset) {
 @implementation FLTCam {
   dispatch_queue_t _dispatchQueue;
   UIDeviceOrientation _deviceOrientation;
+  MLKBarcodeScanner *_barcodeScanner;
 }
 // Format used for video and image streaming.
 FourCharCode videoFormat = kCVPixelFormatType_32BGRA;
@@ -671,6 +691,64 @@ NSString *const errorMethod = @"error";
       CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
     }
   }
+    if (_isScanningBarcode) {
+      if (_imageStreamHandler.eventSink) {
+        CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+        CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+
+        size_t imageWidth = CVPixelBufferGetWidth(pixelBuffer);
+        size_t imageHeight = CVPixelBufferGetHeight(pixelBuffer);
+        OSType format = CVPixelBufferGetPixelFormatType(pixelBuffer);
+
+        NSMutableArray<PlaneData *> *planeData = [NSMutableArray array];
+        NSMutableData *planeBytes = [[NSMutableData alloc] init];
+
+        const Boolean isPlanar = CVPixelBufferIsPlanar(pixelBuffer);
+        size_t planeCount;
+        if (isPlanar) {
+          planeCount = CVPixelBufferGetPlaneCount(pixelBuffer);
+        } else {
+          planeCount = 1;
+        }
+        
+        for (int i = 0; i < planeCount; i++) {
+          void *planeAddress;
+          size_t bytesPerRow;
+          size_t height;
+          size_t width;
+
+          if (isPlanar) {
+            planeAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, i);
+            bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, i);
+            height = CVPixelBufferGetHeightOfPlane(pixelBuffer, i);
+            width = CVPixelBufferGetWidthOfPlane(pixelBuffer, i);
+          } else {
+            planeAddress = CVPixelBufferGetBaseAddress(pixelBuffer);
+            bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer);
+            height = CVPixelBufferGetHeight(pixelBuffer);
+            width = CVPixelBufferGetWidth(pixelBuffer);
+          }
+
+          NSNumber *length = @(bytesPerRow * height);
+          NSData *bytes = [NSData dataWithBytes:planeAddress length:length.unsignedIntegerValue];
+
+          [planeBytes appendData:bytes];
+          [planeData addObject: [[PlaneData alloc] initWithData:[NSNumber numberWithUnsignedLong:width]
+                                                           height:[NSNumber numberWithUnsignedLong:height]
+                                                      bytesPerRow:[NSNumber numberWithUnsignedLong:bytesPerRow]] ];
+        }
+
+        if (!_isDetectingBarcodeFromImage) {
+          [self handleDetection:planeBytes
+                      planeData:planeData
+                         width:[NSNumber numberWithUnsignedLong:imageWidth]
+                         height:[NSNumber numberWithUnsignedLong:imageHeight]
+                         format:(FourCharCode)format];
+        }
+
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+      }
+    }
   if (_isRecording && !_isRecordingPaused) {
     if (_videoWriter.status == AVAssetWriterStatusFailed) {
       [_methodChannel invokeMethod:errorMethod
@@ -1130,6 +1208,22 @@ NSString *const errorMethod = @"error";
   }
 }
 
+- (void)startBarcodeDetectionWithMessenger:(NSObject<FlutterBinaryMessenger> *)messenger{
+    if (!_isScanningBarcode) {
+      FlutterEventChannel *eventChannel =
+          [FlutterEventChannel eventChannelWithName:@"plugins.flutter.io/camera/imageStream"
+                                    binaryMessenger:messenger];
+
+      _imageStreamHandler = [[FLTImageStreamHandler alloc] init];
+      [eventChannel setStreamHandler:_imageStreamHandler];
+      _isScanningBarcode = YES;
+      _isDetectingBarcodeFromImage = NO;
+    } else {
+      [_methodChannel invokeMethod:errorMethod
+                         arguments:@"Images from camera are already streaming!"];
+    }
+}
+
 - (void)stopImageStream {
   if (_isStreamingImages) {
     _isStreamingImages = NO;
@@ -1137,6 +1231,16 @@ NSString *const errorMethod = @"error";
   } else {
     [_methodChannel invokeMethod:errorMethod arguments:@"Images from camera are not streaming!"];
   }
+}
+
+- (void)stopBarcodeDetection {
+    if (_isScanningBarcode) {
+      _isScanningBarcode = NO;
+      _isDetectingBarcodeFromImage = NO;
+      _imageStreamHandler = nil;
+    } else {
+        [_methodChannel invokeMethod:errorMethod arguments:@"Not scanning Barcodes"];
+    }
 }
 
 - (void)getMaxZoomLevelWithResult:(FlutterResult)result {
@@ -1289,6 +1393,43 @@ NSString *const errorMethod = @"error";
     }
   }
 }
+
+- (void)handleDetection:(NSData *)bytes
+              planeData:(NSArray<PlaneData *> *)planeData
+              width:(NSNumber *)width
+              height:(NSNumber *)height
+              format:(FourCharCode)format {
+    MLKVisionImage *image = [MLKVisionImage visionImageFromData:bytes planeData:planeData width:width height:height format:format];
+    
+    MLKBarcodeScannerOptions *options = [[MLKBarcodeScannerOptions alloc] initWithFormats: MLKBarcodeFormatQRCode];
+    _barcodeScanner = [MLKBarcodeScanner barcodeScannerWithOptions:options];
+    
+    _isDetectingBarcodeFromImage = YES;
+    [_barcodeScanner processImage:image
+                      completion:^(NSArray<MLKBarcode *> *barcodes, NSError *error) {
+        if (error) {
+            if (self->_imageStreamHandler.eventSink) {
+              self->_imageStreamHandler.eventSink(getFlutterError(error));
+            }
+            return;
+        } else if (!barcodes) {
+            if (self->_imageStreamHandler.eventSink) {
+              self->_imageStreamHandler.eventSink(@[]);
+            }
+            return;
+        }
+        
+        NSMutableArray *array = [NSMutableArray array];
+        for (MLKBarcode *barcode in barcodes) {
+            [array addObject:[MLKVisionImage barcodeToDictionary:barcode]];
+        }
+        if (self->_imageStreamHandler.eventSink) {
+          self->_imageStreamHandler.eventSink(array);
+        }
+        self->_isDetectingBarcodeFromImage = NO;
+    }];
+}
+
 @end
 
 @interface CameraPlugin ()
@@ -1534,6 +1675,12 @@ NSString *const errorMethod = @"error";
       [_camera pausePreviewWithResult:result];
     } else if ([@"resumePreview" isEqualToString:call.method]) {
       [_camera resumePreviewWithResult:result];
+    } else if ([@"startBarcodeDetection" isEqual:call.method]) {
+        [_camera startBarcodeDetectionWithMessenger:_messenger];
+        result(nil);
+    } else if ([@"stopBarcodeDetection" isEqual:call.method]) {
+        [_camera stopBarcodeDetection];
+        result(nil);
     } else {
       result(FlutterMethodNotImplemented);
     }
